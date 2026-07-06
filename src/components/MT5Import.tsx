@@ -1,6 +1,6 @@
 "use client";
 import { useState, useRef } from "react";
-import { ChevronLeft, Upload, Check, AlertTriangle, RefreshCw } from "./icons";
+import { ChevronLeft, Upload, Check, AlertTriangle, RefreshCw, FileText, Link, Layers } from "./icons";
 import type { Account } from "@/lib/types";
 
 interface MT5ImportProps {
@@ -24,108 +24,200 @@ export interface ParsedTrade {
   rr: string;
 }
 
-// Parse MT5 HTML Statement
-function parseMT5Html(html: string): ParsedTrade[] {
+// Format Symbol (e.g. EURUSD -> EUR/USD, XAUUSD -> XAU/USD, NAS100 -> NAS100)
+function formatSymbol(rawSymbol: string): string {
+  if (!rawSymbol) return "EUR/USD";
+  let s = rawSymbol.trim().toUpperCase().replace(/[^A-Z0-9/]/g, "");
+  if (s.includes("/")) return s;
+  
+  // Standard 6-character forex pair (EURUSD -> EUR/USD)
+  if (s.length === 6 && /^[A-Z]{6}$/.test(s)) {
+    return `${s.slice(0, 3)}/${s.slice(3)}`;
+  }
+  
+  // XAUUSD, XAGUSD, BTCUSD, ETHUSD
+  if (s.length === 6 && (s.startsWith("XAU") || s.startsWith("XAG") || s.startsWith("BTC") || s.startsWith("ETH"))) {
+    return `${s.slice(0, 3)}/${s.slice(3)}`;
+  }
+  
+  return s;
+}
+
+// Parse Date string into ISO format
+function parseDateString(rawDate: string): string {
+  if (!rawDate) return new Date().toISOString();
+  try {
+    // Format YYYY.MM.DD HH:MM:SS -> YYYY-MM-DDTHH:MM:SS
+    const normalized = rawDate.trim().replace(/\./g, "-").replace(" ", "T");
+    const d = new Date(normalized);
+    if (!isNaN(d.getTime())) return d.toISOString();
+  } catch {}
+  return new Date().toISOString();
+}
+
+// Comprehensive MT5 HTML Parser for Desktop & Mobile Reports
+function parseMT5HtmlReport(htmlContent: string): ParsedTrade[] {
   const trades: ParsedTrade[] = [];
   const parser = new DOMParser();
-  const doc = parser.parseFromString(html, "text/html");
-  
-  // Find trade rows - MT5 statements have tables with trade data
+  const doc = parser.parseFromString(htmlContent, "text/html");
+
   const rows = doc.querySelectorAll("tr");
-  
+  if (rows.length === 0) return trades;
+
+  let inPositionsSection = false;
+  let inDealsSection = false;
+
   rows.forEach((row) => {
-    const cells = row.querySelectorAll("td");
-    if (cells.length >= 10) {
-      const text = Array.from(cells).map(c => c.textContent?.trim() || "");
+    const cells = Array.from(row.querySelectorAll("td, th")).map((c) => c.textContent?.trim() || "");
+    const rowText = cells.join(" ").toLowerCase();
+
+    // Check table section headers
+    if (rowText.includes("positions") || rowText.includes("closed transactions")) {
+      inPositionsSection = true;
+      inDealsSection = false;
+      return;
+    }
+    if (rowText.includes("orders") || rowText.includes("working orders")) {
+      inPositionsSection = false;
+      inDealsSection = false;
+      return;
+    }
+    if (rowText.includes("deals") || rowText.includes("history")) {
+      inPositionsSection = false;
+      inDealsSection = true;
+      return;
+    }
+
+    // Try parsing a Position row (MT5 Desktop / Mobile Report)
+    // Typical MT5 Positions row:
+    // Time | Position | Symbol | Type (buy/sell) | Volume | Price | S/L | T/P | Time | Price | Commission | Swap | Profit
+    const buySellIdx = cells.findIndex((c) => c.toLowerCase() === "buy" || c.toLowerCase() === "sell");
+
+    if (buySellIdx >= 0 && cells.length >= 8) {
+      const positionType = cells[buySellIdx].toLowerCase() === "buy" ? "Buy" : "Sell";
       
-      // Look for rows that have buy/sell
-      const typeCell = text.find(t => t.toLowerCase() === "buy" || t.toLowerCase() === "sell");
-      if (typeCell) {
-        // Try to extract trade data
-        const symbolIdx = text.findIndex(t => /^[A-Z]{6}$/.test(t) || /^[A-Z]{3}\/[A-Z]{3}$/.test(t) || /^[A-Z]+\d*$/.test(t));
-        if (symbolIdx >= 0) {
-          const symbol = text[symbolIdx].replace("/", "");
-          const position = typeCell.charAt(0).toUpperCase() + typeCell.slice(1).toLowerCase();
-          
-          // Find numeric values
-          const numbers = text.filter(t => /^-?\d+\.?\d*$/.test(t.replace(/\s/g, "")));
-          
-          if (numbers.length >= 3) {
-            const lotSize = numbers.find(n => parseFloat(n) > 0 && parseFloat(n) < 100) || "0.01";
-            const profit = numbers[numbers.length - 1] || "0";
-            const profitNum = parseFloat(profit);
-            
-            trades.push({
-              pair: symbol.length === 6 ? `${symbol.slice(0, 3)}/${symbol.slice(3)}` : symbol,
-              position,
-              date: new Date().toISOString(),
-              entry: numbers[1] || "",
-              stopLoss: "",
-              takeProfit: "",
-              lotSize,
-              profit: profitNum > 0 ? profit : "0",
-              loss: profitNum < 0 ? Math.abs(profitNum).toString() : "0",
-              commission: "0",
-              result: profitNum > 0 ? "Win" : profitNum < 0 ? "Loss" : "Breakeven",
-              rr: "",
-            });
+      // Symbol is usually right before or right after buy/sell
+      let symbol = "";
+      if (buySellIdx > 0 && /^[A-Z0-9/.#_-]{3,12}$/i.test(cells[buySellIdx - 1])) {
+        symbol = cells[buySellIdx - 1];
+      } else if (buySellIdx < cells.length - 1 && /^[A-Z0-9/.#_-]{3,12}$/i.test(cells[buySellIdx + 1])) {
+        symbol = cells[buySellIdx + 1];
+      } else {
+        const symbolCell = cells.find((c) => /^[A-Z0-9]{6}$/i.test(c) || /^[A-Z0-9]{3}\/[A-Z0-9]{3}$/i.test(c) || /^(XAU|XAG|NAS|US30|SPX|BTC|ETH)/i.test(c));
+        if (symbolCell) symbol = symbolCell;
+      }
+
+      if (symbol) {
+        // Date: usually in the first or second cell
+        const dateCell = cells.find((c) => /\d{4}[.\-/]\d{2}[.\-/]\d{2}/.test(c));
+        const tradeDate = parseDateString(dateCell || "");
+
+        // Volume / Lot Size: numeric value usually near buy/sell
+        const numbers = cells.map((c) => c.replace(/\s/g, "")).filter((c) => /^-?\d+\.?\d*$/.test(c));
+        const lotSize = numbers.find((n) => parseFloat(n) > 0 && parseFloat(n) <= 100) || "0.01";
+
+        // Entry Price & Profit
+        // Profit is almost always the LAST numeric cell in the row
+        let profitVal = "0";
+        if (numbers.length > 0) {
+          profitVal = numbers[numbers.length - 1];
+        }
+
+        const profitNum = parseFloat(profitVal) || 0;
+        const result = profitNum > 0 ? "Win" : profitNum < 0 ? "Loss" : "Breakeven";
+
+        // Entry, Stop Loss, Take Profit
+        const entryPrice = numbers.length >= 2 ? numbers[1] : "";
+        const slPrice = cells.find((c) => c !== "0" && c !== "0.00" && c !== "0.00000" && /^\d+\.\d+$/.test(c)) || "";
+        
+        // Calculate RR if SL and Entry are present
+        let rrVal = "";
+        if (entryPrice && slPrice) {
+          const entryNum = parseFloat(entryPrice);
+          const slNum = parseFloat(slPrice);
+          const risk = Math.abs(entryNum - slNum);
+          if (risk > 0 && Math.abs(profitNum) > 0) {
+            rrVal = (Math.abs(profitNum) / (risk * 100)).toFixed(1);
           }
         }
+
+        trades.push({
+          pair: formatSymbol(symbol),
+          position: positionType,
+          date: tradeDate,
+          entry: entryPrice,
+          stopLoss: slPrice,
+          takeProfit: "",
+          lotSize,
+          profit: profitNum > 0 ? Math.abs(profitNum).toString() : "0",
+          loss: profitNum < 0 ? Math.abs(profitNum).toString() : "0",
+          commission: "0",
+          result,
+          rr: rrVal,
+        });
       }
     }
   });
-  
+
   return trades;
 }
 
-// Parse MT5 CSV/Text format
-function parseMT5Text(text: string): ParsedTrade[] {
+// Fallback Text / CSV / Simple Format Parser
+function parseMT5TextReport(text: string): ParsedTrade[] {
   const trades: ParsedTrade[] = [];
-  const lines = text.split("\n").filter(l => l.trim());
-  
+  const lines = text.split("\n").filter((l) => l.trim());
+
   for (const line of lines) {
-    // Try different delimiters
-    const parts = line.includes("\t") ? line.split("\t") : line.split(/[,;]/);
-    
-    if (parts.length >= 6) {
-      // Look for buy/sell
-      const typeIdx = parts.findIndex(p => /^(buy|sell)$/i.test(p.trim()));
+    const parts = line.includes("\t")
+      ? line.split("\t")
+      : line.split(/[,;|]/);
+
+    if (parts.length >= 3) {
+      const trimmedParts = parts.map((p) => p.trim());
+
+      // Find Position Type (Buy/Sell)
+      const typeIdx = trimmedParts.findIndex((p) => /^(buy|sell)$/i.test(p));
       if (typeIdx >= 0) {
-        const position = parts[typeIdx].trim();
-        
-        // Find symbol (usually EURUSD, GBPUSD, etc.)
-        const symbolPart = parts.find(p => /^[A-Z]{6,}$/i.test(p.trim()) || /^[A-Z]+\/[A-Z]+$/i.test(p.trim()));
-        if (symbolPart) {
-          const symbol = symbolPart.trim().toUpperCase().replace("/", "");
-          
-          // Find numbers for lot, price, profit
-          const numbers = parts.map(p => p.trim()).filter(p => /^-?\d+\.?\d*$/.test(p));
-          
-          // Find date
-          const datePart = parts.find(p => /\d{4}[.\-/]\d{2}[.\-/]\d{2}/.test(p) || /\d{2}[.\-/]\d{2}[.\-/]\d{4}/.test(p));
-          let tradeDate = new Date().toISOString();
-          if (datePart) {
-            try {
-              const d = new Date(datePart.trim());
-              if (!isNaN(d.getTime())) tradeDate = d.toISOString();
-            } catch {}
-          }
-          
-          if (numbers.length >= 2) {
-            const profit = parseFloat(numbers[numbers.length - 1]) || 0;
-            
+        const position = trimmedParts[typeIdx].toLowerCase() === "buy" ? "Buy" : "Sell";
+
+        // Find Symbol
+        const symbolCell = trimmedParts.find(
+          (p) =>
+            /^[A-Z0-9/]{3,12}$/i.test(p) &&
+            !/^(buy|sell|win|loss|profit|total|balance)$/i.test(p)
+        );
+
+        if (symbolCell) {
+          // Find Date
+          const dateCell = trimmedParts.find((p) =>
+            /\d{4}[.\-/]\d{2}[.\-/]\d{2}/.test(p)
+          );
+          const tradeDate = parseDateString(dateCell || "");
+
+          // Find Numbers
+          const numbers = trimmedParts.filter((p) =>
+            /^-?\d+\.?\d*$/.test(p.replace(/\s/g, ""))
+          );
+
+          if (numbers.length > 0) {
+            const lastNum = parseFloat(numbers[numbers.length - 1]) || 0;
+            const lotSize =
+              numbers.find((n) => parseFloat(n) > 0 && parseFloat(n) <= 100) ||
+              "0.01";
+
             trades.push({
-              pair: symbol.length === 6 ? `${symbol.slice(0, 3)}/${symbol.slice(3)}` : symbol,
-              position: position.charAt(0).toUpperCase() + position.slice(1).toLowerCase(),
+              pair: formatSymbol(symbolCell),
+              position,
               date: tradeDate,
               entry: numbers[0] || "",
               stopLoss: "",
               takeProfit: "",
-              lotSize: numbers.find(n => parseFloat(n) > 0 && parseFloat(n) < 100) || "0.01",
-              profit: profit > 0 ? profit.toString() : "0",
-              loss: profit < 0 ? Math.abs(profit).toString() : "0",
+              lotSize,
+              profit: lastNum > 0 ? Math.abs(lastNum).toString() : "0",
+              loss: lastNum < 0 ? Math.abs(lastNum).toString() : "0",
               commission: "0",
-              result: profit > 0 ? "Win" : profit < 0 ? "Loss" : "Breakeven",
+              result:
+                lastNum > 0 ? "Win" : lastNum < 0 ? "Loss" : "Breakeven",
               rr: "",
             });
           }
@@ -133,52 +225,13 @@ function parseMT5Text(text: string): ParsedTrade[] {
       }
     }
   }
-  
-  return trades;
-}
 
-// Simple manual paste format: Symbol, Buy/Sell, Entry, SL, TP, Lot, Profit
-function parseSimpleFormat(text: string): ParsedTrade[] {
-  const trades: ParsedTrade[] = [];
-  const lines = text.split("\n").filter(l => l.trim());
-  
-  for (const line of lines) {
-    const parts = line.split(/[\t,;|]/).map(p => p.trim());
-    
-    if (parts.length >= 3) {
-      const symbol = parts[0]?.toUpperCase() || "";
-      const position = parts[1] || "Buy";
-      const entry = parts[2] || "";
-      const stopLoss = parts[3] || "";
-      const takeProfit = parts[4] || "";
-      const lotSize = parts[5] || "0.01";
-      const profitStr = parts[6] || "0";
-      const profit = parseFloat(profitStr) || 0;
-      
-      if (symbol && (position.toLowerCase() === "buy" || position.toLowerCase() === "sell")) {
-        trades.push({
-          pair: symbol.includes("/") ? symbol : symbol.length === 6 ? `${symbol.slice(0, 3)}/${symbol.slice(3)}` : symbol,
-          position: position.charAt(0).toUpperCase() + position.slice(1).toLowerCase(),
-          date: new Date().toISOString(),
-          entry,
-          stopLoss,
-          takeProfit,
-          lotSize,
-          profit: profit > 0 ? profit.toString() : "0",
-          loss: profit < 0 ? Math.abs(profit).toString() : "0",
-          commission: "0",
-          result: profit > 0 ? "Win" : profit < 0 ? "Loss" : "Breakeven",
-          rr: "",
-        });
-      }
-    }
-  }
-  
   return trades;
 }
 
 export default function MT5Import({ account, onBack, onImport }: MT5ImportProps) {
   const [pasteData, setPasteData] = useState("");
+  const [fileName, setFileName] = useState("");
   const [parsedTrades, setParsedTrades] = useState<ParsedTrade[]>([]);
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState("");
@@ -188,24 +241,19 @@ export default function MT5Import({ account, onBack, onImport }: MT5ImportProps)
   const handleParse = () => {
     setError("");
     let trades: ParsedTrade[] = [];
-    
-    // Try HTML first
+
+    // Try HTML Report Parser
     if (pasteData.includes("<") && pasteData.includes(">")) {
-      trades = parseMT5Html(pasteData);
+      trades = parseMT5HtmlReport(pasteData);
     }
-    
-    // If no trades found, try CSV/text
+
+    // Fallback to Text / CSV Parser
     if (trades.length === 0) {
-      trades = parseMT5Text(pasteData);
+      trades = parseMT5TextReport(pasteData);
     }
-    
-    // If still no trades, try simple format
+
     if (trades.length === 0) {
-      trades = parseSimpleFormat(pasteData);
-    }
-    
-    if (trades.length === 0) {
-      setError("Could not parse any trades. Please check the format.");
+      setError("No trades could be parsed from the file/text. Make sure it's an MT5 HTML report or statement file.");
     } else {
       setParsedTrades(trades);
     }
@@ -214,11 +262,29 @@ export default function MT5Import({ account, onBack, onImport }: MT5ImportProps)
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    
+
+    setFileName(file.name);
+    setError("");
+
     const reader = new FileReader();
     reader.onload = (event) => {
       const content = event.target?.result as string;
       setPasteData(content);
+
+      // Auto parse on upload
+      let trades: ParsedTrade[] = [];
+      if (content.includes("<") && content.includes(">")) {
+        trades = parseMT5HtmlReport(content);
+      }
+      if (trades.length === 0) {
+        trades = parseMT5TextReport(content);
+      }
+
+      if (trades.length > 0) {
+        setParsedTrades(trades);
+      } else {
+        setError("Could not parse trades automatically. Click 'Parse Trades' to try again.");
+      }
     };
     reader.readAsText(file);
   };
@@ -227,13 +293,14 @@ export default function MT5Import({ account, onBack, onImport }: MT5ImportProps)
     if (parsedTrades.length === 0) return;
     setImporting(true);
     setError("");
-    
+
     try {
       await onImport(parsedTrades);
       setSuccess(true);
       setTimeout(() => onBack(), 1500);
     } catch (err) {
-      setError("Failed to import trades");
+      console.error(err);
+      setError("Failed to import trades into database.");
     } finally {
       setImporting(false);
     }
@@ -247,63 +314,77 @@ export default function MT5Import({ account, onBack, onImport }: MT5ImportProps)
           <ChevronLeft className="w-5 h-5 text-white" />
         </button>
         <div className="flex-1">
-          <h1 className="text-lg font-bold text-white">Import from MT5</h1>
+          <h1 className="text-lg font-bold text-white">Import MetaTrader 5 Report</h1>
           <p className="text-dark-300 text-xs">{account.name}</p>
         </div>
       </div>
 
       {success ? (
-        <div className="glass-card rounded-2xl p-8 text-center">
-          <div className="w-16 h-16 rounded-full bg-green-500/20 flex items-center justify-center mx-auto mb-4">
+        <div className="glass-card rounded-2xl p-8 text-center animate-slide-up">
+          <div className="w-16 h-16 rounded-full bg-green-500/20 flex items-center justify-center mx-auto mb-4 border border-green-500/30">
             <Check className="w-8 h-8 text-green-400" />
           </div>
           <h2 className="text-white font-bold text-lg">Import Successful!</h2>
-          <p className="text-dark-300 text-sm mt-2">{parsedTrades.length} trades imported</p>
+          <p className="text-dark-300 text-sm mt-2">{parsedTrades.length} trades added to {account.name}</p>
         </div>
       ) : (
         <>
-          {/* Instructions */}
+          {/* How to export HTML from MT5 */}
           <div className="glass-card rounded-2xl p-4 mb-4">
-            <h3 className="text-white font-semibold text-sm mb-2">📱 How to Export from MT5:</h3>
-            <ol className="text-dark-200 text-xs space-y-2">
-              <li>1. Open MT5 app → Go to <span className="text-accent-400">History</span> tab</li>
-              <li>2. Tap the <span className="text-accent-400">⋮</span> menu → Select <span className="text-accent-400">Statement</span></li>
-              <li>3. Choose date range → Tap <span className="text-accent-400">Share</span> or <span className="text-accent-400">Copy</span></li>
-              <li>4. Paste the content below or upload the file</li>
-            </ol>
+            <h3 className="text-white font-semibold text-sm mb-2 flex items-center gap-2">
+              <FileText className="w-4 h-4 text-accent-400" /> MT5 HTML Report Import
+            </h3>
+            <div className="text-dark-200 text-xs space-y-1.5 leading-relaxed">
+              <p>1. Open <span className="text-white font-medium">MT5 Desktop or Mobile</span></p>
+              <p>2. Go to <span className="text-accent-400 font-medium">History</span> tab</p>
+              <p>3. Right-click / Menu ➔ <span className="text-accent-400 font-medium">Report ➔ HTML Statement</span></p>
+              <p>4. Upload the <span className="text-white font-medium">.html</span> file below or paste its code!</p>
+            </div>
           </div>
 
-          {/* Upload Area */}
-          <div className="glass-card rounded-2xl p-4 mb-4">
-            <div className="flex gap-2 mb-3">
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                className="flex-1 py-3 rounded-xl glass border border-accent-500/30 flex items-center justify-center gap-2 text-accent-400"
-              >
-                <Upload className="w-4 h-4" />
-                <span className="text-sm font-medium">Upload File</span>
-              </button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".html,.htm,.csv,.txt"
-                onChange={handleFileUpload}
-                className="hidden"
-              />
-            </div>
+          {/* Upload Button */}
+          <div className="glass-card rounded-2xl p-4 mb-4 space-y-3">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".html,.htm,.csv,.txt"
+              onChange={handleFileUpload}
+              className="hidden"
+            />
 
-            <div className="text-center text-dark-400 text-xs mb-3">— or paste below —</div>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="w-full py-3.5 rounded-xl gradient-bg text-white text-sm font-semibold flex items-center justify-center gap-2 hover:opacity-90 transition-all shadow-lg glow"
+            >
+              <Upload className="w-5 h-5" />
+              Upload MT5 HTML File (.html / .csv)
+            </button>
+
+            {fileName && (
+              <div className="flex items-center gap-2 p-2.5 rounded-xl bg-dark-700/50 border border-dark-600">
+                <FileText className="w-4 h-4 text-accent-400" />
+                <span className="text-xs text-white truncate flex-1">{fileName}</span>
+                <button
+                  onClick={() => { setFileName(""); setPasteData(""); setParsedTrades([]); }}
+                  className="text-dark-400 text-xs hover:text-white"
+                >
+                  Clear
+                </button>
+              </div>
+            )}
+
+            <div className="text-center text-dark-400 text-xs font-medium py-1">— or paste HTML / Statement code —</div>
 
             <textarea
-              rows={6}
-              placeholder="Paste MT5 statement here...&#10;&#10;Or use simple format:&#10;EURUSD, Buy, 1.0850, 1.0800, 1.0950, 0.5, 125.50&#10;GBPUSD, Sell, 1.2700, 1.2750, 1.2600, 0.3, -50.00"
+              rows={5}
+              placeholder="Paste HTML code or CSV statement text here..."
               value={pasteData}
               onChange={(e) => setPasteData(e.target.value)}
-              className="w-full !rounded-xl !text-xs"
+              className="w-full !rounded-xl !text-xs font-mono"
             />
 
             {error && (
-              <div className="flex items-center gap-2 mt-3 p-3 rounded-xl bg-red-500/10 border border-red-500/30">
+              <div className="flex items-center gap-2 p-3 rounded-xl bg-red-500/10 border border-red-500/30">
                 <AlertTriangle className="w-4 h-4 text-red-400 flex-shrink-0" />
                 <p className="text-red-400 text-xs">{error}</p>
               </div>
@@ -312,51 +393,50 @@ export default function MT5Import({ account, onBack, onImport }: MT5ImportProps)
             <button
               onClick={handleParse}
               disabled={!pasteData.trim()}
-              className="w-full mt-3 py-3 rounded-xl gradient-bg text-white text-sm font-semibold disabled:opacity-40 flex items-center justify-center gap-2"
+              className="w-full py-2.5 rounded-xl glass border border-accent-500/30 text-accent-400 text-sm font-medium disabled:opacity-40 flex items-center justify-center gap-2"
             >
               <RefreshCw className="w-4 h-4" />
-              Parse Trades
+              Parse & Preview Trades
             </button>
           </div>
 
           {/* Parsed Trades Preview */}
           {parsedTrades.length > 0 && (
-            <div className="glass-card rounded-2xl p-4 mb-4">
+            <div className="glass-card rounded-2xl p-4 mb-4 animate-slide-up">
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-white font-semibold text-sm">📊 Found {parsedTrades.length} Trades</h3>
                 <button
                   onClick={() => setParsedTrades([])}
-                  className="text-xs text-dark-400"
+                  className="text-xs text-dark-400 hover:text-white"
                 >
                   Clear
                 </button>
               </div>
 
-              <div className="space-y-2 max-h-64 overflow-y-auto">
+              <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
                 {parsedTrades.map((trade, i) => (
-                  <div key={i} className="bg-dark-700/30 rounded-xl p-3 flex items-center justify-between">
+                  <div key={i} className="bg-dark-700/40 rounded-xl p-3 flex items-center justify-between border border-dark-600/30">
                     <div>
                       <div className="flex items-center gap-2">
-                        <span className="text-white font-medium text-sm">{trade.pair}</span>
-                        <span className={`text-[10px] px-2 py-0.5 rounded-full ${
+                        <span className="text-white font-bold text-sm">{trade.pair}</span>
+                        <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
                           trade.position === "Buy" ? "bg-green-500/20 text-green-400" : "bg-red-500/20 text-red-400"
                         }`}>
                           {trade.position}
                         </span>
                       </div>
-                      <p className="text-dark-400 text-[10px]">
+                      <p className="text-dark-300 text-[10px] mt-0.5">
                         Lot: {trade.lotSize} · Entry: {trade.entry || "—"}
                       </p>
                     </div>
+
                     <div className="text-right">
                       <p className={`font-bold text-sm ${
                         trade.result === "Win" ? "text-green-400" : trade.result === "Loss" ? "text-red-400" : "text-gray-400"
                       }`}>
                         {trade.result === "Win" ? `+$${trade.profit}` : trade.result === "Loss" ? `-$${trade.loss}` : "$0"}
                       </p>
-                      <p className={`text-[10px] ${
-                        trade.result === "Win" ? "text-green-400" : trade.result === "Loss" ? "text-red-400" : "text-gray-400"
-                      }`}>
+                      <p className="text-[10px] text-dark-400">
                         {trade.result}
                       </p>
                     </div>
@@ -367,33 +447,22 @@ export default function MT5Import({ account, onBack, onImport }: MT5ImportProps)
               <button
                 onClick={handleImport}
                 disabled={importing}
-                className="w-full mt-4 py-3 rounded-xl bg-green-500/20 border border-green-500/30 text-green-400 text-sm font-semibold flex items-center justify-center gap-2 disabled:opacity-50"
+                className="w-full mt-4 py-3.5 rounded-xl gradient-green text-white text-sm font-bold flex items-center justify-center gap-2 disabled:opacity-50 shadow-lg glow-green"
               >
                 {importing ? (
                   <>
                     <RefreshCw className="w-4 h-4 animate-spin" />
-                    Importing...
+                    Importing to Database...
                   </>
                 ) : (
                   <>
-                    <Check className="w-4 h-4" />
-                    Import {parsedTrades.length} Trades
+                    <Check className="w-5 h-5" />
+                    Import All {parsedTrades.length} Trades Now
                   </>
                 )}
               </button>
             </div>
           )}
-
-          {/* Simple Format Guide */}
-          <div className="glass-card rounded-2xl p-4">
-            <h3 className="text-white font-semibold text-sm mb-2">✍️ Manual Format</h3>
-            <p className="text-dark-300 text-xs mb-2">You can also paste trades in this simple format:</p>
-            <div className="bg-dark-700/50 rounded-lg p-3 font-mono text-[10px] text-dark-200">
-              Symbol, Position, Entry, SL, TP, Lot, Profit<br/>
-              <span className="text-green-400">EURUSD, Buy, 1.0850, 1.0800, 1.0950, 0.5, 125.50</span><br/>
-              <span className="text-red-400">GBPUSD, Sell, 1.2700, 1.2750, 1.2600, 0.3, -50.00</span>
-            </div>
-          </div>
         </>
       )}
     </div>
