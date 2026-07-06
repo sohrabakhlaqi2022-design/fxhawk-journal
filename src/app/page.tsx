@@ -13,6 +13,7 @@ import MissedTrades from "@/components/MissedTrades";
 import OffSessionTrades from "@/components/OffSessionTrades";
 import BottomNav from "@/components/BottomNav";
 import type { Trade, Account, MissedTrade, OffSessionTrade } from "@/lib/types";
+import { saveMedia, mergeMediaToTrades, extractAndSaveMedia, estimateMediaStorage, deleteAllMediaForTrade } from "@/lib/mediaStorage";
 
 type Screen = "dashboard" | "add" | "analytics" | "calendar" | "search" | "settings" | "detail" | "edit" | "accounts" | "mt5import" | "missed" | "offsession";
 
@@ -33,6 +34,7 @@ export default function App() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [missedTrades, setMissedTrades] = useState<MissedTrade[]>([]);
   const [offSessionTrades, setOffSessionTrades] = useState<OffSessionTrade[]>([]);
+  const [mediaStats, setMediaStats] = useState({ used: 0, total: 50, items: 0 });
   const [selectedAccountId, setSelectedAccountId] = useState<number | null>(null);
   const [importingAccountId, setImportingAccountId] = useState<number | null>(null);
   const [screen, setScreen] = useState<Screen>("dashboard");
@@ -48,9 +50,13 @@ export default function App() {
         fetch("/api/accounts"), fetch("/api/trades/all"), fetch("/api/missed"), fetch("/api/offsession"),
       ]);
       if (a.ok) setAccounts((await a.json()).accounts || []);
-      if (t.ok) setTrades((await t.json()).trades || []);
+      if (t.ok) {
+        const tradesData = (await t.json()).trades || [];
+        setTrades(mergeMediaToTrades(tradesData));
+      }
       if (m.ok) setMissedTrades((await m.json()).missedTrades || []);
       if (o.ok) setOffSessionTrades((await o.json()).offSessionTrades || []);
+      setMediaStats(estimateMediaStorage());
     } catch (err) { console.error("Reload error:", err); }
   }, []);
 
@@ -92,14 +98,35 @@ export default function App() {
 
   // ===== TRADE =====
   const handleSaveTrade = async (data: Partial<Trade>) => {
-    const res = await fetch("/api/trades/all", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+    // Save media to localStorage
+    if (data.screenshotBefore) { saveMedia(0, "screenshotBefore_temp", data.screenshotBefore); }
+    if (data.screenshotAfter) { saveMedia(0, "screenshotAfter_temp", data.screenshotAfter); }
+    if (data.voiceNote) { saveMedia(0, "voiceNote_temp", data.voiceNote); }
+    
+    // Send only text data to Neon
+    const cleanData = extractAndSaveMedia(data);
+    const res = await fetch("/api/trades/all", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cleanData) });
     const json = await res.json();
     if (!res.ok || !json.trade) throw new Error(json.error || "Failed to save trade");
+    
+    // Move media from temp key to the real trade ID
+    const newId = json.trade.id;
+    if (data.screenshotBefore) { saveMedia(newId, "screenshotBefore", data.screenshotBefore); localStorage.removeItem("fxhawk_media_0_screenshotBefore_temp"); }
+    if (data.screenshotAfter) { saveMedia(newId, "screenshotAfter", data.screenshotAfter); localStorage.removeItem("fxhawk_media_0_screenshotAfter_temp"); }
+    if (data.voiceNote) { saveMedia(newId, "voiceNote", data.voiceNote); localStorage.removeItem("fxhawk_media_0_voiceNote_temp"); }
+    
     await reloadAll();
   };
   const handleUpdateTrade = async (data: Partial<Trade>) => {
     if (!selectedTrade) return;
-    const res = await fetch(`/api/trades/all/${selectedTrade.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+    // Save media locally
+    if (data.screenshotBefore) saveMedia(selectedTrade.id, "screenshotBefore", data.screenshotBefore);
+    if (data.screenshotAfter) saveMedia(selectedTrade.id, "screenshotAfter", data.screenshotAfter);
+    if (data.voiceNote) saveMedia(selectedTrade.id, "voiceNote", data.voiceNote);
+    
+    // Send only text to Neon
+    const cleanData = extractAndSaveMedia(data);
+    const res = await fetch(`/api/trades/all/${selectedTrade.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cleanData) });
     if (!res.ok) throw new Error("Failed to update");
     const { trade } = await res.json();
     setSelectedTrade(trade);
@@ -108,6 +135,7 @@ export default function App() {
   };
   const handleDeleteTrade = async (id: number) => {
     await fetch(`/api/trades/all/${id}`, { method: "DELETE" });
+    deleteAllMediaForTrade(id);
     setScreen("dashboard");
     setSelectedTrade(null);
     await reloadAll();
@@ -162,7 +190,7 @@ export default function App() {
       {screen === "calendar" && <CalendarView trades={filteredTrades} accounts={accounts} selectedAccountId={selectedAccountId} onSelectAccount={setSelectedAccountId} onViewTrade={handleViewTrade} />}
       {screen === "missed" && <MissedTrades missedTrades={missedTrades} accounts={accounts} selectedAccountId={selectedAccountId} onSelectAccount={setSelectedAccountId} onSave={handleSaveMissed} onDelete={handleDeleteMissed} onBack={() => setScreen("dashboard")} />}
       {screen === "offsession" && <OffSessionTrades offSessionTrades={offSessionTrades} accounts={accounts} selectedAccountId={selectedAccountId} onSelectAccount={setSelectedAccountId} onSave={handleSaveOffSession} onDelete={handleDeleteOffSession} onBack={() => setScreen("dashboard")} />}
-      {screen === "settings" && <SettingsScreen accounts={accounts} trades={trades} onClearData={() => {}} />}
+      {screen === "settings" && <SettingsScreen accounts={accounts} trades={trades} onClearData={() => {}} mediaStats={mediaStats} />}
       <BottomNav active={screen} onNavigate={setScreen} />
     </div>
   );
