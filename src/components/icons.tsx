@@ -7,7 +7,7 @@ import {
   Activity, PieChart, Zap, BarChart2, Layers,
   User, Lock, Mail, AlertTriangle, BookOpen, Brain, Heart, Star,
   Mic, Square, Play, Pause, Camera, Image, Volume2,
-  Upload, RefreshCw, Download, Link
+  Upload, RefreshCw, Download, Link, HardDrive
 } from "lucide-react";
 
 export {
@@ -18,5 +18,5 @@ export {
   Activity, PieChart, Zap, BarChart2, Layers,
   User, Lock, Mail, AlertTriangle, BookOpen, Brain, Heart, Star,
   Mic, Square, Play, Pause, Camera, Image, Volume2,
-  Upload, RefreshCw, Download, Link
+  Upload, RefreshCw, Download, Link, HardDrive
 };
